@@ -443,6 +443,7 @@ func (na NetworkAddress) ListenQUIC(ctx context.Context, portOffset uint, config
 		ln := lnAny.(net.PacketConn)
 
 		h3ln := ln
+		var observers []QUICHandshakeObserver
 		if len(pcWrappers) == 0 {
 			for {
 				// retrieve the underlying socket, so quic-go can optimize.
@@ -456,14 +457,36 @@ func (na NetworkAddress) ListenQUIC(ctx context.Context, portOffset uint, config
 			// wrap packet conn before QUIC
 			for _, pcWrapper := range pcWrappers {
 				h3ln = pcWrapper.WrapPacketConn(h3ln)
+				if o, ok := pcWrapper.(QUICHandshakeObserver); ok {
+					observers = append(observers, o)
+				}
 			}
 		}
 
 		sqs := newSharedQUICState(tlsConf)
+		getConfigForClient := sqs.getConfigForClient
+		var connContext func(context.Context, *quic.ClientInfo) (context.Context, error)
+		if len(observers) > 0 {
+			getConfigForClient = func(ch *tls.ClientHelloInfo) (*tls.Config, error) {
+				for _, o := range observers {
+					o.ObserveQUICClientHello(ch)
+				}
+				return sqs.getConfigForClient(ch)
+			}
+			connContext = func(ctx context.Context, info *quic.ClientInfo) (context.Context, error) {
+				var err error
+				for _, o := range observers {
+					if ctx, err = o.QUICConnContext(ctx, info); err != nil {
+						return nil, err
+					}
+				}
+				return ctx, nil
+			}
+		}
 		// http3.ConfigureTLSConfig only uses this field and tls App sets this field as well
 		//nolint:gosec
 		quicTlsConfig := &tls.Config{
-			GetConfigForClient:          sqs.getConfigForClient,
+			GetConfigForClient:          getConfigForClient,
 			GetEncryptedClientHelloKeys: sqs.getEncryptedClientHelloKeys,
 		}
 		// Require clients to verify their source address when we're handling more than 1000 handshakes per second.
@@ -472,6 +495,7 @@ func (na NetworkAddress) ListenQUIC(ctx context.Context, portOffset uint, config
 		tr := &quic.Transport{
 			Conn:                h3ln,
 			VerifySourceAddress: func(addr net.Addr) bool { return !limiter.Allow() },
+			ConnContext:         connContext,
 		}
 		allow0rtt := true
 		if allow0rttconf != nil {
@@ -730,6 +754,25 @@ type ListenerWrapper interface {
 // appropriate.
 type PacketConnWrapper interface {
 	WrapPacketConn(net.PacketConn) net.PacketConn
+}
+
+// QUICHandshakeObserver may be implemented by a PacketConnWrapper module
+// that needs to associate a QUIC connection's TLS ClientHello with the
+// HTTP/3 requests it carries.
+//
+// QUICConnContext is called for each new QUIC connection; the context it
+// returns becomes the connection's context, from which the TLS handshake
+// context (tls.ClientHelloInfo.Context) and every HTTP/3 request context
+// are derived. Returning an error rejects the connection.
+// ObserveQUICClientHello is called with each ClientHello before the TLS
+// configuration is chosen.
+//
+// QUIC listeners are shared across config reloads, so the observers of
+// the config that first opened a listener stay in use for its lifetime.
+// Implementations should keep per-connection state in the context only.
+type QUICHandshakeObserver interface {
+	QUICConnContext(context.Context, *quic.ClientInfo) (context.Context, error)
+	ObserveQUICClientHello(*tls.ClientHelloInfo)
 }
 
 // listenerPool stores and allows reuse of active listeners.
